@@ -125,12 +125,18 @@ CONFIG = {
     "ML_RETRAIN_INTERVAL": 20,          # هر چند معامله‌ی جدید، مدل دوباره آموزش ببیند
     "ML_MAX_INFLUENCE": 0.35,           # حداکثر سهم مدل ML از امتیاز نهایی (وقتی کاملاً بالغ شده)
     "ML_FULL_MATURITY_TRADES": 250,     # از این تعداد به بعد، مدل سهم کامل (ML_MAX_INFLUENCE) می‌گیرد
-    # آستانه‌ی اضافه بر اساس رژیم بازار - داده‌ی واقعی نشان داد VOLATILE ضعیف‌ترین عملکرد را دارد
+    # آستانه‌ی اضافه بر اساس رژیم بازار - VOLATILE از قبل فیلتر سخت‌گیرانه دارد و جواب داده (وین‌ریت 55%).
+    # حالا با نمونه‌ی بزرگ و پایدار (108 معامله)، TRENDING هم به‌طور پیوسته ضعیف عمل کرده (35%)
+    # با اینکه 70% حجم سیگنال از همینجاست - آستانه‌ی متوسط (نه به‌شدت VOLATILE) تا حجم زیاد افت نکند
     "REGIME_CONFIDENCE_ADJUSTMENT": {
         "VOLATILE": 1.5,
-        "TRENDING": 0,
+        "TRENDING": 1.0,
         "UNKNOWN": 0.5,
     },
+    "REGIME_MIN_TRADES_FOR_ADJUST": 25,     # حداقل نمونه‌ی هر رژیم قبل از تنظیم خودکار آستانه‌اش
+    "REGIME_MAX_ADJUSTMENT": 2.5,           # سقف افزایش آستانه برای هر رژیم
+    "REGIME_ADJUSTMENT_STEP": 0.3,          # حداکثر تغییر آستانه در هر دور بهینه‌سازی (تدریجی، نه پرشی)
+    "REGIME_ADJUSTMENT_SENSITIVITY": 0.15,  # هر چقدر بزرگ‌تر، به فاصله‌ی وین‌ریت رژیم حساس‌تر می‌شود
     
     # آستانه‌های تطبیقی
     "ADAPTIVE_PUMP_THRESHOLD": False,
@@ -1072,6 +1078,64 @@ class AdaptiveParameterOptimizer:
         except Exception as e:
             logger.error(f"خطا در اعمال پارامترهای بهینه شده: {e}")
 
+    def optimize_regime_thresholds(self) -> None:
+        """خودکار تنظیم می‌کند که هر رژیم بازار (VOLATILE/TRENDING/UNKNOWN) چقدر آستانه‌ی اطمینان
+        اضافه نیاز دارد - بر اساس اینکه وین‌ریت واقعی آن رژیم چقدر از میانگین کل عقب‌تر است.
+        این جایگزین دستی‌کاری REGIME_CONFIDENCE_ADJUSTMENT است که قبلاً با دست انجام می‌شد.
+
+        دو لایه‌ی محافظتی دارد (درسی که از اشتباه قبلی گرفته شد - نتیجه‌گیری با نمونه‌ی 7 تایی):
+        1. حداقل نمونه‌ی نسبتاً بزرگ برای هر رژیم (REGIME_MIN_TRADES_FOR_ADJUST) قبل از هر تغییری
+        2. تغییر تدریجی و پله‌ای (REGIME_ADJUSTMENT_STEP) به‌جای پرش مستقیم به مقدار هدف،
+           تا حتی اگر یک محاسبه‌ی لحظه‌ای پرت باشد، اثرش روی کل سیستم فقط تدریجی ظاهر شود"""
+        try:
+            min_samples = CONFIG.get("REGIME_MIN_TRADES_FOR_ADJUST", 25)
+            max_adjustment = CONFIG.get("REGIME_MAX_ADJUSTMENT", 2.5)
+            step = CONFIG.get("REGIME_ADJUSTMENT_STEP", 0.3)
+            sensitivity = CONFIG.get("REGIME_ADJUSTMENT_SENSITIVITY", 0.15)
+            
+            regime_perf = self.memory.get_market_regime_performance()
+            overall_winrate = self.memory.get_winrate()
+            if not overall_winrate:
+                return
+            
+            current_adj = CONFIG.get("REGIME_CONFIDENCE_ADJUSTMENT", {}).copy()
+            changed = False
+            
+            for regime, stats in regime_perf.items():
+                if regime in ("RANGING",):
+                    continue  # RANGING از قبل و به‌طور کامل در enhanced_analysis حذف می‌شود
+                total = stats.get("total", 0)
+                if total < min_samples:
+                    continue
+                
+                regime_wr = stats.get("winrate", 0.0)
+                gap = overall_winrate - regime_wr  # مثبت یعنی این رژیم بدتر از میانگین کل است
+                target_adj = max(0.0, min(max_adjustment, gap * sensitivity))
+                current = current_adj.get(regime, 0.0)
+                
+                if abs(target_adj - current) < 0.05:
+                    continue
+                
+                new_adj = current + step if target_adj > current else current - step
+                new_adj = max(0.0, min(max_adjustment, new_adj))
+                # اگر فاصله تا هدف از step کمتر بود، مستقیم به هدف برس (نه رد شدن از آن)
+                if abs(target_adj - current) < step:
+                    new_adj = target_adj
+                
+                current_adj[regime] = round(new_adj, 2)
+                changed = True
+                logger.info(
+                    f"🎯 آستانه‌ی رژیم {regime} خودکار به‌روزرسانی شد: {current:.2f} → {new_adj:.2f} "
+                    f"(وین‌ریت رژیم: {regime_wr:.0f}% | میانگین کل: {overall_winrate:.0f}% | نمونه: {total})"
+                )
+            
+            if changed:
+                with CONFIG_LOCK:
+                    CONFIG["REGIME_CONFIDENCE_ADJUSTMENT"] = current_adj
+                    
+        except Exception as e:
+            logger.error(f"خطا در تنظیم خودکار آستانه‌ی رژیم: {e}")
+
 
 # ============================================================================
 # بخش 7: کلاس یادگیری وزن ویژگی (FeatureWeightLearner) - کامل
@@ -1850,6 +1914,7 @@ class AutoLearningSystem:
                                 param_optimizer.optimize(force=True)
                                 param_optimizer.apply_optimized_params()
                                 ml_model.train()  # خودش تشخیص می‌دهد که آیا واقعاً وقت بازآموزی رسیده یا نه
+                                param_optimizer.optimize_regime_thresholds()
                             except Exception as learn_err:
                                 # این بخش نباید بتواند کل پردازش صف را متوقف کند
                                 logger.error(f"خطا در به‌روزرسانی یادگیری (نادیده گرفته شد، صف ادامه می‌یابد): {learn_err}")
@@ -3343,6 +3408,7 @@ def update_learning_system() -> None:
     weight_learner.update_weights()
     pattern_recognizer.learn_patterns()
     ml_model.train(force=True)  # بازآموزی کامل مدل ML هر 24 ساعت، صرف‌نظر از فاصله‌ی معمول
+    param_optimizer.optimize_regime_thresholds()
     
     summary = performance_memory.get_summary()
     logger.info(f"✅ خلاصه عملکرد: {summary['total_trades']} معامله, وین‌ریت: {summary['long_term_winrate']:.1f}%")
@@ -3380,8 +3446,12 @@ def build_learning_report(price_map: Dict[str, float]) -> str:
         if regimes:
             lines.append("")
             lines.append("🌐 عملکرد به‌ازای رژیم بازار:")
+            regime_adj = CONFIG.get("REGIME_CONFIDENCE_ADJUSTMENT", {})
+            base_conf = CONFIG.get("MIN_CONFIDENCE_SCORE", 6)
             for regime, stats in regimes.items():
-                lines.append(f"  • {regime}: {stats['wins']}/{stats['total']} برد ({stats.get('winrate', 0):.0f}%)")
+                adj = regime_adj.get(regime, 0)
+                threshold_note = f" | آستانه: {base_conf + adj:.1f}" if adj > 0 else ""
+                lines.append(f"  • {regime}: {stats['wins']}/{stats['total']} برد ({stats.get('winrate', 0):.0f}%){threshold_note}")
 
         # وضعیت مدل یادگیری ماشین واقعی (فقط اگر scikit-learn نصب باشد)
         if SKLEARN_AVAILABLE:
@@ -3607,7 +3677,7 @@ def main_loop():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 سیستم تحلیل سیگنال نسخه 10.0 - با مدل یادگیری ماشین واقعی (scikit-learn)")
+    print("🚀 سیستم تحلیل سیگنال نسخه 11.0 - آستانه‌ی رژیم بازار هم خودکار می‌شود")
     print("📚 یادگیری از سیگنال‌هایی که خودش می‌دهد (Walk-Forward + Path-based)")
     print("🎯 کمترین ضریب خطا - کاملاً خودکار")
     print("🔍 با قابلیت خطایابی کامل در هر بخش")
