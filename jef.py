@@ -125,6 +125,8 @@ CONFIG = {
     "ML_RETRAIN_INTERVAL": 20,          # هر چند معامله‌ی جدید، مدل دوباره آموزش ببیند
     "ML_MAX_INFLUENCE": 0.35,           # حداکثر سهم مدل ML از امتیاز نهایی (وقتی کاملاً بالغ شده)
     "ML_FULL_MATURITY_TRADES": 250,     # از این تعداد به بعد، مدل سهم کامل (ML_MAX_INFLUENCE) می‌گیرد
+    "ML_MIN_AUC_FOR_INFLUENCE": 0.55,   # زیر این AUC، مدل هیچ سهمی نمی‌گیرد صرف‌نظر از تعداد نمونه
+    "ML_FULL_AUC_FOR_INFLUENCE": 0.65,  # از این AUC به بعد، سهم کیفیت مدل کامل می‌شود
     # آستانه‌ی اضافه بر اساس رژیم بازار - VOLATILE از قبل فیلتر سخت‌گیرانه دارد و جواب داده (وین‌ریت 55%).
     # حالا با نمونه‌ی بزرگ و پایدار (108 معامله)، TRENDING هم به‌طور پیوسته ضعیف عمل کرده (35%)
     # با اینکه 70% حجم سیگنال از همینجاست - آستانه‌ی متوسط (نه به‌شدت VOLATILE) تا حجم زیاد افت نکند
@@ -1450,20 +1452,31 @@ class MLConfidenceModel:
             return None
 
     def get_influence_weight(self) -> float:
-        """سهم مدل ML از امتیاز نهایی - صفر تا زمانی که آموزش ندیده، و بعد به‌تدریج تا سقف
-        ML_MAX_INFLUENCE افزایش می‌یابد، متناسب با تعداد معاملاتی که مدل رویشان آموزش دیده"""
+        """سهم مدل ML از امتیاز نهایی - نه فقط بر اساس تعداد معاملات (بلوغ داده)، بلکه بر اساس
+        کیفیت واقعی مدل (AUC روی داده‌ی تست) هم گیت می‌شود. تجربه‌ی واقعی نشان داد بدون این گیت،
+        سهم مدل صرفاً با گذر زمان زیاد می‌شد حتی وقتی AUC از حدس تصادفی (0.5) هم بدتر بود -
+        یعنی داشتیم به یک مدل ضعیف‌تر از شانس، وزن بیشتری می‌دادیم. الان: اگر AUC به‌وضوح
+        بهتر از تصادفی نباشد، سهم صفر می‌ماند صرف‌نظر از تعداد معامله."""
         if not self.is_trained:
             return 0.0
+        
+        min_auc = CONFIG.get("ML_MIN_AUC_FOR_INFLUENCE", 0.55)
+        full_auc = CONFIG.get("ML_FULL_AUC_FOR_INFLUENCE", 0.65)
+        if self.last_test_auc is None or self.last_test_auc < min_auc:
+            return 0.0
+        auc_quality = min(1.0, (self.last_test_auc - min_auc) / max(0.01, (full_auc - min_auc)))
+        
         n = self.trained_on_n_trades
         min_t = CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 50)
         full_t = CONFIG.get("ML_FULL_MATURITY_TRADES", 250)
         max_influence = CONFIG.get("ML_MAX_INFLUENCE", 0.35)
         if n < min_t:
             return 0.0
-        if n >= full_t:
-            return max_influence
-        progress = (n - min_t) / max(1, (full_t - min_t))
-        return progress * max_influence
+        sample_maturity = 1.0 if n >= full_t else (n - min_t) / max(1, (full_t - min_t))
+        
+        # هر دو شرط باید برقرار باشند: هم داده کافی، هم کیفیت واقعی مدل - ضرب می‌شوند نه جمع،
+        # تا یک مدل تازه‌آموزش‌دیده با AUC عالی هم فوراً سهم کامل نگیرد و بالعکس
+        return sample_maturity * auc_quality * max_influence
 
 
 
@@ -3464,6 +3477,9 @@ def build_learning_report(price_map: Dict[str, float]) -> str:
                     lines.append(f"  • AUC روی داده‌ی تست (ندیده): {ml_model.last_test_auc}")
                 lines.append(f"  • دقت روی داده‌ی تست: {ml_model.last_test_accuracy}")
                 lines.append(f"  • سهم فعلی از امتیاز نهایی: {influence_pct:.0f}%")
+                min_auc = CONFIG.get("ML_MIN_AUC_FOR_INFLUENCE", 0.55)
+                if influence_pct == 0 and ml_model.last_test_auc is not None and ml_model.last_test_auc < min_auc:
+                    lines.append(f"    (صفر است چون AUC هنوز به {min_auc} نرسیده - مدل هنوز بهتر از حدس تصادفی نیست)")
             else:
                 needed = CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 50)
                 lines.append(f"  • هنوز آموزش ندیده - نیاز به {needed} معامله (فعلاً {len(performance_memory.trades)})")
@@ -3677,7 +3693,7 @@ def main_loop():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 سیستم تحلیل سیگنال نسخه 11.0 - آستانه‌ی رژیم بازار هم خودکار می‌شود")
+    print("🚀 سیستم تحلیل سیگنال نسخه 11.1 - سهم مدل ML به کیفیت واقعی (AUC) هم گره خورد")
     print("📚 یادگیری از سیگنال‌هایی که خودش می‌دهد (Walk-Forward + Path-based)")
     print("🎯 کمترین ضریب خطا - کاملاً خودکار")
     print("🔍 با قابلیت خطایابی کامل در هر بخش")
