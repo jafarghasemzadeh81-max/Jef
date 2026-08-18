@@ -1993,7 +1993,7 @@ class AutoLearningSystem:
         بر اساس آخرین قیمت لحظه‌ای - برای گزارش ساعتی، بدون نیاز به درخواست شبکه اضافه.
         توجه: این فقط یک تخمین لحظه‌ای است (نه بررسی کامل مسیر)؛ نتیجه نهایی و قطعی
         هر معامله همچنان توسط _simulate_outcome پس از گذشت AUTO_LEARN_HOURS محاسبه می‌شود."""
-        result = {"total_pending": len(self.learning_queue), "tp1_hit": 0, "sl_hit": 0, "still_open": 0, "unknown": 0, "items": []}
+        result = {"total_pending": len(self.learning_queue), "tp1_hit": 0, "sl_hit": 0, "still_open": 0, "unknown": 0, "items": [], "regime_counts": {}}
         try:
             for item in self.learning_queue:
                 signal = item.get("signal", {})
@@ -2002,6 +2002,8 @@ class AutoLearningSystem:
                 entry = signal.get("entry")
                 sl = signal.get("sl")
                 tps = signal.get("tps") or []
+                regime = signal.get("market_regime", "UNKNOWN")
+                result["regime_counts"][regime] = result["regime_counts"].get(regime, 0) + 1
                 current_price = price_map.get(symbol)
 
                 if current_price is None or entry is None or sl is None or not tps:
@@ -2032,7 +2034,7 @@ class AutoLearningSystem:
                 elapsed_min = int((time.time() - item.get("timestamp", time.time())) / 60)
                 result["items"].append({
                     "symbol": symbol, "direction": direction, "status": status,
-                    "confidence": item.get("confidence", 0), "elapsed_min": elapsed_min
+                    "confidence": item.get("confidence", 0), "elapsed_min": elapsed_min, "regime": regime
                 })
         except Exception as e:
             logger.error(f"خطا در بررسی وضعیت صف انتظار: {e}")
@@ -3312,7 +3314,12 @@ def enhanced_analysis(symbol: str, direction_hint: Optional[str] = None) -> Opti
         # پس باید سخت‌گیرانه‌تر فیلتر شود، نه رد کامل (شاید بعضی سیگنال‌های خیلی قوی هنوز ارزش داشته باشند)
         min_confidence = CONFIG["MIN_CONFIDENCE_SCORE"] + CONFIG.get("REGIME_CONFIDENCE_ADJUSTMENT", {}).get(regime, 0)
         
+        # ثبت آماری - چند سیگنال از هر رژیم ارزیابی و چند تا واقعاً قبول شدند (برای گزارش ساعتی،
+        # تا بشود فهمید یک رژیم اصلاً سیگنال تولید نمی‌کند یا فقط رد صلاحیت می‌شود)
+        _REGIME_GATE_STATS["evaluated"][regime] = _REGIME_GATE_STATS["evaluated"].get(regime, 0) + 1
+        
         if signal and signal.get("confidence", 0) >= min_confidence:
+            _REGIME_GATE_STATS["passed"][regime] = _REGIME_GATE_STATS["passed"].get(regime, 0) + 1
             return signal
         
         return None
@@ -3431,6 +3438,10 @@ def update_learning_system() -> None:
 # نگهداری آخرین وزن‌های فیچر که گزارش شده‌اند - برای نمایش میزان تغییر در هر گزارش ساعتی
 _LAST_REPORTED_WEIGHTS: Dict[str, float] = {}
 
+# شمارنده‌ی سیگنال‌های ارزیابی‌شده در برابر رد/قبول‌شده، به‌ازای هر رژیم بازار - از آخرین گزارش ساعتی.
+# برای تشخیص اینکه آیا یک رژیم خاص (مثلاً VOLATILE) اصلاً سیگنال تولید نمی‌کند یا فقط رد صلاحیت می‌شود
+_REGIME_GATE_STATS: Dict[str, Dict[str, int]] = {"evaluated": {}, "passed": {}}
+
 
 def build_learning_report(price_map: Dict[str, float]) -> str:
     """ساخت متن گزارش ساعتی یادگیری: چه چیزی یاد گرفته شده + وضعیت سیگنال‌های در انتظار"""
@@ -3465,6 +3476,19 @@ def build_learning_report(price_map: Dict[str, float]) -> str:
                 adj = regime_adj.get(regime, 0)
                 threshold_note = f" | آستانه: {base_conf + adj:.1f}" if adj > 0 else ""
                 lines.append(f"  • {regime}: {stats['wins']}/{stats['total']} برد ({stats.get('winrate', 0):.0f}%){threshold_note}")
+
+        # از آخرین گزارش تا الان: چند سیگنال از هر رژیم اصلاً بررسی شد و چند تا رد صلاحیت شدند -
+        # برای تشخیص اینکه یک رژیم اصلاً سیگنال تولید نمی‌کند یا فقط فیلتر می‌شود
+        evaluated = _REGIME_GATE_STATS.get("evaluated", {})
+        if evaluated:
+            lines.append("")
+            lines.append("🔍 سیگنال‌های بررسی‌شده از گزارش قبل (قبول/کل):")
+            for regime in sorted(evaluated.keys()):
+                ev = evaluated.get(regime, 0)
+                passed = _REGIME_GATE_STATS.get("passed", {}).get(regime, 0)
+                lines.append(f"  • {regime}: {passed}/{ev} قبول شد")
+        _REGIME_GATE_STATS["evaluated"] = {}
+        _REGIME_GATE_STATS["passed"] = {}
 
         # وضعیت مدل یادگیری ماشین واقعی (فقط اگر scikit-learn نصب باشد)
         if SKLEARN_AVAILABLE:
@@ -3521,9 +3545,13 @@ def build_learning_report(price_map: Dict[str, float]) -> str:
             lines.append(f"  • هنوز باز: {pending['still_open']}")
             if pending["unknown"]:
                 lines.append(f"  • نامشخص (بدون قیمت لحظه‌ای): {pending['unknown']}")
+            regime_counts = pending.get("regime_counts", {})
+            if regime_counts:
+                counts_str = ", ".join(f"{r}: {c}" for r, c in sorted(regime_counts.items()))
+                lines.append(f"  • ترکیب رژیم صف: {counts_str}")
             for it in pending["items"][:10]:
                 emoji = {"TP1_HIT": "✅", "SL_HIT": "❌", "OPEN": "⏳"}.get(it["status"], "❔")
-                lines.append(f"     {emoji} {it['symbol']} {it['direction']} - {it['elapsed_min']} دقیقه پیش")
+                lines.append(f"     {emoji} {it['symbol']} {it['direction']} [{it.get('regime','?')}] - {it['elapsed_min']} دقیقه پیش")
 
         return "\n".join(lines)
     except Exception as e:
@@ -3693,7 +3721,7 @@ def main_loop():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 سیستم تحلیل سیگنال نسخه 11.1 - سهم مدل ML به کیفیت واقعی (AUC) هم گره خورد")
+    print("🚀 سیستم تحلیل سیگنال نسخه 11.2 - دیدبانی رد/قبول سیگنال به‌ازای رژیم بازار")
     print("📚 یادگیری از سیگنال‌هایی که خودش می‌دهد (Walk-Forward + Path-based)")
     print("🎯 کمترین ضریب خطا - کاملاً خودکار")
     print("🔍 با قابلیت خطایابی کامل در هر بخش")
