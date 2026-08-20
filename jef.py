@@ -1498,10 +1498,10 @@ class MLConfidenceModel:
         if not SKLEARN_AVAILABLE:
             return False
         n = len(self.memory.trades)
-        if n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 60):
+        if n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 30):
             return False
         valid_n = sum(1 for t in self.memory.trades if t.get("outcome_label") in ("TP1", "TP2", "TP3", "SL"))
-        if valid_n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 60):
+        if valid_n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 30):
             return False
         return (valid_n - self.trained_on_n_trades) >= CONFIG.get("ML_RETRAIN_INTERVAL", 50) or not self.is_trained
 
@@ -1519,7 +1519,7 @@ class MLConfidenceModel:
         }
 
     def _walk_forward(self, X, y):
-        min_train = CONFIG.get("ML_MIN_TRAIN_SAMPLES", 60)
+        min_train = CONFIG.get("ML_MIN_TRAIN_SAMPLES", 30)
         block = CONFIG.get("ML_TEST_BLOCK", 25)
         min_folds = CONFIG.get("ML_MIN_WF_FOLDS", 3)
         results = {name: {"auc": [], "brier": [], "accuracy": []} for name in self._make_models()}
@@ -1561,7 +1561,7 @@ class MLConfidenceModel:
         try:
             X, y = self._build_dataset()
             n = len(y)
-            min_n = CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 60)
+            min_n = CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 30)
             if n < min_n or len(set(y.tolist())) < 2:
                 logger.info(f"🤖 ML: نمونه معتبر کافی نیست ({n}/{min_n})")
                 self.is_trained = False
@@ -1590,7 +1590,7 @@ class MLConfidenceModel:
 
             # آخرین fold برای گزارش تست نگه داشته می‌شود، ولی معیار activation میانگین WF است.
             last_train_end = n - CONFIG.get("ML_TEST_BLOCK", 25)
-            last_train_end = max(CONFIG.get("ML_MIN_TRAIN_SAMPLES", 60), last_train_end)
+            last_train_end = max(CONFIG.get("ML_MIN_TRAIN_SAMPLES", 30), last_train_end)
             base = self._make_models()[best_name]
             inner_splits = min(3, max(2, last_train_end // 25))
             final_model = CalibratedClassifierCV(base, method="sigmoid", cv=TimeSeriesSplit(n_splits=inner_splits))
