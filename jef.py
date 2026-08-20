@@ -241,8 +241,8 @@ CONFIG = {
     "ADX_TREND_MIN": 20,
     
     # تلگرام (اختیاری)
-    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-    "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
+    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", "8044605578:AAEQEZcm8tNeZGD1FeYGw4bWe_n9Vb-pWFI"),
+    "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", "-1002906437733"),
 }
 
 BASE_CONFIG = CONFIG.copy()
