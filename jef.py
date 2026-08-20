@@ -121,7 +121,7 @@ CONFIG = {
     # آستانه‌های سیگنال
     "PUMP_THRESHOLD": 2.8,   # کمی کاهش‌یافته نسبت به 2.8 برای افزایش تعداد سیگنال - نه به‌اندازه‌ی مقدار تستی قدیمی (1.6)
     "DUMP_THRESHOLD": -2.8,
-    "MIN_CONFIDENCE_SCORE": 6,  # به مقدار پایدار قبلی برگشت (5.5 با نمونه‌ی کم باعث افت واقعی کیفیت شد)
+    "MIN_CONFIDENCE_SCORE": 5.5,  # به مقدار پایدار قبلی برگشت (5.5 با نمونه‌ی کم باعث افت واقعی کیفیت شد)
     "REJECT_COUNTER_TREND_WARNINGS": True,  # سیگنال خلاف روند اصلی حذف شود؛ داده اخیر PF<1 است
     "PERMANENT_HISTORY_ENABLED": True,
     "WEIGHT_SHARPEN_EXPONENT_MAX": 2.0,   # حداکثر شدت تشدید - فقط وقتی وزن‌ها با نمونه‌ی زیاد پخته شده باشند
@@ -139,7 +139,7 @@ CONFIG = {
     "ML_MIN_WF_FOLDS": 3,                # حداقل تعداد fold معتبر Walk-Forward
     "ML_MIN_WF_AUC": 0.56,               # میانگین AUC لازم برای فعال شدن
     "ML_MAX_WF_AUC_STD": 0.08,           # جلوگیری از مدل‌های ناپایدار
-    "ML_MIN_TRAIN_SAMPLES": 60,          # حداقل train در هر fold
+    "ML_MIN_TRAIN_SAMPLES": 30,          # حداقل train در هر fold
     "ML_TEST_BLOCK": 25,                 # اندازه هر بلوک تست Walk-Forward
     "ML_MODEL_VERSION": 3,
     # آستانه‌ی اضافه بر اساس رژیم بازار - VOLATILE از قبل فیلتر سخت‌گیرانه دارد و جواب داده (وین‌ریت 55%).
@@ -190,7 +190,7 @@ CONFIG = {
     "ATR_MULT_SL": 2.0,
     "ATR_MULT_MIN": 1.2,
     "ATR_MULT_MAX": 3.5,
-    "TP_ATR_MULTS": [2.0, 3.0, 4.0],  # TP1 برابر با فاصله‌ی SL شد (1R) به‌جای 0.5R قبلی - نیاز به وین‌ریت کمتر برای سودآوری
+    "TP_ATR_MULTS": [1.5, 2.5, 4.0],  # TP1 برابر با فاصله‌ی SL شد (1R) به‌جای 0.5R قبلی - نیاز به وین‌ریت کمتر برای سودآوری
     
     # بک‌تست
     "BACKTEST_CANDLES": 1000,
