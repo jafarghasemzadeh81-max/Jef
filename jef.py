@@ -40,9 +40,13 @@ import pandas as pd
 # اختیاری است: اگر نصب نباشد (مثلاً روی محیط‌های محدود مثل Termux)، ربات کاملاً عادی کار می‌کند
 # و فقط این بخش غیرفعال می‌ماند - هیچ‌جای دیگر کد به این کتابخانه وابسته نیست.
 try:
-    from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import roc_auc_score, accuracy_score
+    from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
     import joblib
     SKLEARN_AVAILABLE = True
 except ImportError:
@@ -121,12 +125,19 @@ CONFIG = {
     "WEIGHT_SHARPEN_FULL_TRADES": 300,    # از این تعداد به بعد، تشدید کامل (MAX) اعمال می‌شود
 
     # مدل یادگیری ماشین واقعی (فقط اگر scikit-learn نصب باشد فعال می‌شود)
-    "ML_MIN_TRADES_TO_TRAIN": 50,      # حداقل معامله برای اولین آموزش مدل
-    "ML_RETRAIN_INTERVAL": 20,          # هر چند معامله‌ی جدید، مدل دوباره آموزش ببیند
-    "ML_MAX_INFLUENCE": 0.35,           # حداکثر سهم مدل ML از امتیاز نهایی (وقتی کاملاً بالغ شده)
-    "ML_FULL_MATURITY_TRADES": 250,     # از این تعداد به بعد، مدل سهم کامل (ML_MAX_INFLUENCE) می‌گیرد
-    "ML_MIN_AUC_FOR_INFLUENCE": 0.55,   # زیر این AUC، مدل هیچ سهمی نمی‌گیرد صرف‌نظر از تعداد نمونه
-    "ML_FULL_AUC_FOR_INFLUENCE": 0.65,  # از این AUC به بعد، سهم کیفیت مدل کامل می‌شود
+    # ML محافظه‌کار: فقط معاملات دارای outcome قطعی TP/SL آموزش داده می‌شوند.
+    "ML_MIN_TRADES_TO_TRAIN": 60,       # حداقل نمونه‌های معتبر برای شروع
+    "ML_RETRAIN_INTERVAL": 50,          # جلوگیری از بازآموزی بیش از حد و دنبال‌کردن نویز
+    "ML_MAX_INFLUENCE": 0.15,            # ML فقط meta-filter است، نه تصمیم‌گیر اصلی
+    "ML_FULL_MATURITY_TRADES": 400,      # بلوغ تدریجی
+    "ML_MIN_AUC_FOR_INFLUENCE": 0.56,    # حداقل AUC برای هرگونه اثر
+    "ML_FULL_AUC_FOR_INFLUENCE": 0.65,   # AUC لازم برای حداکثر سهم
+    "ML_MIN_WF_FOLDS": 3,                # حداقل تعداد fold معتبر Walk-Forward
+    "ML_MIN_WF_AUC": 0.56,               # میانگین AUC لازم برای فعال شدن
+    "ML_MAX_WF_AUC_STD": 0.08,           # جلوگیری از مدل‌های ناپایدار
+    "ML_MIN_TRAIN_SAMPLES": 60,          # حداقل train در هر fold
+    "ML_TEST_BLOCK": 25,                 # اندازه هر بلوک تست Walk-Forward
+    "ML_MODEL_VERSION": 2,
     # آستانه‌ی اضافه بر اساس رژیم بازار - VOLATILE از قبل فیلتر سخت‌گیرانه دارد و جواب داده (وین‌ریت 55%).
     # حالا با نمونه‌ی بزرگ و پایدار (108 معامله)، TRENDING هم به‌طور پیوسته ضعیف عمل کرده (35%)
     # با اینکه 70% حجم سیگنال از همینجاست - آستانه‌ی متوسط (نه به‌شدت VOLATILE) تا حجم زیاد افت نکند
@@ -522,6 +533,14 @@ class PerformanceMemory:
                 "holding_time": trade_data.get("holding_time", 0),
                 "max_favorable": trade_data.get("max_favorable", 0),
                 "max_adverse": trade_data.get("max_adverse", 0),
+                # outcome_label is deliberately separate from win: TIMEOUT is not a clean ML label.
+                "which_target": trade_data.get("which_target"),
+                "outcome_label": trade_data.get("outcome_label"),
+                "auto_learned": bool(trade_data.get("auto_learned", False)),
+                "pre_signal_change_15m": trade_data.get("pre_signal_change_15m"),
+                "time_to_result_min": trade_data.get("time_to_result_min"),
+                "mfe_pct": trade_data.get("mfe_pct"),
+                "mae_pct": trade_data.get("mae_pct"),
             }
             self.trades.append(trade_record)
             self.short_term_trades.append(trade_record)
@@ -1164,8 +1183,8 @@ class FeatureWeightLearner:
         }
         self.short_term_weights: dict = self.feature_weights.copy()
         self.weights_history: list = []
-        self.learning_rate: float = 0.15
-        self.momentum: float = 0.85
+        self.learning_rate: float = 0.05
+        self.momentum: float = 0.50
         self.weight_changes: dict = {}
         self.correlation_threshold_positive: float = 0.15
         self.correlation_threshold_negative: float = -0.08
@@ -1177,17 +1196,20 @@ class FeatureWeightLearner:
             if os.path.exists(PATHS["FEATURE_WEIGHTS_FILE"]):
                 with open(PATHS["FEATURE_WEIGHTS_FILE"], "r") as f:
                     saved = json.load(f)
-                    if isinstance(saved, dict):
-                        for key, value in saved.items():
-                            if key in self.feature_weights:
-                                self.feature_weights[key] = max(0.1, min(3.0, float(value)))
-                logger.debug(f"وزن‌های ویژگی بارگذاری شد: {self.feature_weights}")
+                # فایل‌های قدیمی وزن‌های بسیار تهاجمی داشتند؛ برای نسخه جدید عمداً reset می‌شوند.
+                if isinstance(saved, dict) and saved.get("version") == 2 and isinstance(saved.get("weights"), dict):
+                    for key, value in saved["weights"].items():
+                        if key in self.feature_weights and isinstance(value, (int, float)):
+                            self.feature_weights[key] = max(0.50, min(1.50, float(value)))
+                    logger.debug(f"وزن‌های ویژگی نسخه 2 بارگذاری شد: {self.feature_weights}")
+                else:
+                    logger.info("🧠 وزن‌های قدیمی شناسایی شد؛ وزن‌ها برای جلوگیری از انتقال نویز روی 1.0 reset شدند")
         except Exception as e:
             logger.warning(f"خطا در بارگذاری وزن ویژگی‌ها: {e}")
 
     def _save_weights(self):
         try:
-            _atomic_write_json(PATHS["FEATURE_WEIGHTS_FILE"], self.feature_weights)
+            _atomic_write_json(PATHS["FEATURE_WEIGHTS_FILE"], {"version": 2, "weights": self.feature_weights})
             self.weights_history.append({
                 "timestamp": time.time(),
                 "weights": self.feature_weights.copy()
@@ -1210,23 +1232,26 @@ class FeatureWeightLearner:
             
             for feature_name in list(self.feature_weights.keys()):
                 correlation = self.memory.get_feature_correlation(feature_name, window=window)
-                
+                current = self.feature_weights[feature_name]
+
+                # تغییر وزن فقط از همبستگی پنجره اخیر و با سقف 5% در هر دور.
+                # momentum قبلی باعث می‌شد تغییرات انباشته شوند و وزن‌ها به 2.5/0.2 پرتاب شوند.
                 if correlation > self.correlation_threshold_positive:
-                    delta = self.learning_rate * abs(correlation) * correlation
-                    new_weight = self.feature_weights[feature_name] * (1 + delta)
-                    new_weight = min(2.5, new_weight)
+                    raw_delta = self.learning_rate * correlation
                 elif correlation < self.correlation_threshold_negative:
-                    delta = self.learning_rate * abs(correlation)
-                    new_weight = self.feature_weights[feature_name] * (1 - delta)
-                    new_weight = max(0.2, new_weight)
+                    raw_delta = self.learning_rate * correlation
                 else:
-                    new_weight = self.feature_weights[feature_name] * 0.99 + 0.01
-                
-                if feature_name in self.weight_changes:
-                    new_weight += self.weight_changes[feature_name]
-                
-                change = new_weight - self.feature_weights[feature_name]
-                self.weight_changes[feature_name] = change * self.momentum
+                    raw_delta = 0.0
+
+                max_step = 0.05 * max(0.5, current)
+                raw_delta = max(-max_step, min(max_step, raw_delta))
+                new_weight = current + raw_delta
+                new_weight = max(0.50, min(1.50, new_weight))
+
+                # EMA بسیار آرام؛ بدون افزودن دوباره delta قبلی
+                new_weight = current * (1.0 - self.momentum) + new_weight * self.momentum
+                change = new_weight - current
+                self.weight_changes[feature_name] = change
                 self.feature_weights[feature_name] = new_weight
                 
                 status = "📈" if new_weight > old_weights[feature_name] else "📉" if new_weight < old_weights[feature_name] else "➖"
@@ -1253,7 +1278,7 @@ class FeatureWeightLearner:
         n = len(self.memory.trades)
         min_t = CONFIG.get("WEIGHT_SHARPEN_MIN_TRADES", 100)
         full_t = CONFIG.get("WEIGHT_SHARPEN_FULL_TRADES", 300)
-        max_exp = CONFIG.get("WEIGHT_SHARPEN_EXPONENT_MAX", 2.0)
+        max_exp = min(CONFIG.get("WEIGHT_SHARPEN_EXPONENT_MAX", 2.0), 1.35)
         if n < min_t:
             return 1.0
         if n >= full_t:
@@ -1297,16 +1322,12 @@ class FeatureWeightLearner:
 # ============================================================================
 
 class MLConfidenceModel:
-    """مدل یادگیری ماشین واقعی برای پیش‌بینی احتمال برد یک سیگنال، بر اساس فیچرهایش.
-    برخلاف FeatureWeightLearner (که فقط همبستگی خطی هر فیچر را جدا حساب می‌کند)، این مدل
-    (Gradient Boosting) می‌تواند تعامل غیرخطی بین چند فیچر را هم یاد بگیرد - مثلاً
-    "اگر multi_tf_alignment بالا و همزمان volatility پایین بود، احتمال برد خیلی بیشتر است"
-    که یک مدل خطی/همبستگی‌محور اصلاً نمی‌تواند ببیند.
+    """ML meta-filter محافظه‌کارانه.
 
-    طراحی محافظه‌کارانه است: تا وقتی داده کافی نباشد (ML_MIN_TRADES_TO_TRAIN)، مدل اصلاً آموزش
-    نمی‌بیند و هیچ اثری روی امتیاز نهایی ندارد؛ و حتی بعد از آموزش، سهمش از امتیاز نهایی به‌تدریج
-    و متناسب با تعداد معاملات افزایش می‌یابد (دقیقاً همان فلسفه‌ی WEIGHT_SHARPEN که از overfit
-    زودهنگام روی داده‌ی کم جلوگیری می‌کند - درسی که از تجربه‌ی قبلی گرفته شده)."""
+    فقط outcomeهای قطعی TP/SL وارد آموزش می‌شوند؛ TIMEOUT حذف می‌شود.
+    مدل‌ها با Walk-Forward زمانی مقایسه می‌شوند و بهترین مدل انتخاب می‌شود.
+    Probability مدل نهایی با calibration سیگموید تنظیم می‌شود.
+    """
 
     FEATURE_NAMES = [
         "trend_alignment", "volume_confirmation", "multi_tf_alignment",
@@ -1314,6 +1335,7 @@ class MLConfidenceModel:
         "volatility_regime", "adx_strength", "cci_signal", "williams_signal",
         "mfi_signal", "supertrend_alignment",
     ]
+    MODEL_VERSION = 2
 
     def __init__(self, memory: "PerformanceMemory"):
         self.memory = memory
@@ -1322,64 +1344,147 @@ class MLConfidenceModel:
         self.trained_on_n_trades = 0
         self.last_test_auc: Optional[float] = None
         self.last_test_accuracy: Optional[float] = None
+        self.last_brier: Optional[float] = None
+        self.wf_auc_mean: Optional[float] = None
+        self.wf_auc_std: Optional[float] = None
+        self.wf_folds: int = 0
+        self.selected_model_name: Optional[str] = None
         self.last_train_time: float = 0.0
+        self.model_version = self.MODEL_VERSION
         if SKLEARN_AVAILABLE:
             self._load_model()
 
     def _load_model(self):
         try:
-            if os.path.exists(PATHS["ML_MODEL_FILE"]):
-                saved = joblib.load(PATHS["ML_MODEL_FILE"])
-                self.model = saved.get("model")
-                self.trained_on_n_trades = saved.get("trained_on_n_trades", 0)
-                self.last_test_auc = saved.get("last_test_auc")
-                self.last_test_accuracy = saved.get("last_test_accuracy")
-                self.is_trained = self.model is not None
-                if self.is_trained:
-                    logger.info(f"🤖 مدل ML بارگذاری شد (آموزش‌دیده روی {self.trained_on_n_trades} معامله، AUC تست: {self.last_test_auc})")
+            if not os.path.exists(PATHS["ML_MODEL_FILE"]):
+                return
+            saved = joblib.load(PATHS["ML_MODEL_FILE"])
+            if saved.get("model_version") != self.MODEL_VERSION:
+                logger.info("🤖 مدل ML قدیمی است؛ نسخه جدید از صفر ارزیابی می‌شود")
+                return
+            self.model = saved.get("model")
+            self.trained_on_n_trades = saved.get("trained_on_n_trades", 0)
+            self.last_test_auc = saved.get("last_test_auc")
+            self.last_test_accuracy = saved.get("last_test_accuracy")
+            self.last_brier = saved.get("last_brier")
+            self.wf_auc_mean = saved.get("wf_auc_mean")
+            self.wf_auc_std = saved.get("wf_auc_std")
+            self.wf_folds = saved.get("wf_folds", 0)
+            self.selected_model_name = saved.get("selected_model_name")
+            self.is_trained = self.model is not None
+            if self.is_trained:
+                logger.info(f"🤖 مدل ML v{self.MODEL_VERSION} بارگذاری شد | مدل: {self.selected_model_name} | WF AUC: {self.wf_auc_mean}")
         except Exception as e:
             logger.warning(f"مدل ML قبلی بارگذاری نشد (از نو آموزش داده می‌شود): {e}")
 
     def _save_model(self):
         try:
             joblib.dump({
+                "model_version": self.MODEL_VERSION,
                 "model": self.model,
                 "trained_on_n_trades": self.trained_on_n_trades,
                 "last_test_auc": self.last_test_auc,
                 "last_test_accuracy": self.last_test_accuracy,
+                "last_brier": self.last_brier,
+                "wf_auc_mean": self.wf_auc_mean,
+                "wf_auc_std": self.wf_auc_std,
+                "wf_folds": self.wf_folds,
+                "selected_model_name": self.selected_model_name,
             }, PATHS["ML_MODEL_FILE"])
         except Exception as e:
             logger.error(f"خطا در ذخیره مدل ML: {e}")
 
     def _build_dataset(self):
         X, y = [], []
+        skipped_timeout = 0
+        skipped_missing = 0
         for trade in self.memory.trades:
             feats = trade.get("features", {})
+            label = trade.get("outcome_label")
+            # برای داده‌های جدید label صریح است. داده‌های قدیمی بدون label عمداً حذف می‌شوند.
+            if label not in ("TP1", "TP2", "TP3", "SL"):
+                skipped_timeout += 1
+                continue
             if not feats:
+                skipped_missing += 1
                 continue
             row = []
             valid = True
             for name in self.FEATURE_NAMES:
                 v = feats.get(name)
-                if v is None or not isinstance(v, (int, float)):
-                    row.append(0.0)
-                else:
-                    row.append(float(v))
+                if v is None or not isinstance(v, (int, float)) or not np.isfinite(float(v)):
+                    valid = False
+                    break
+                row.append(float(v))
+            if not valid:
+                skipped_missing += 1
+                continue
             X.append(row)
-            y.append(1 if trade.get("win") else 0)
-        return np.array(X), np.array(y)
+            y.append(1 if label.startswith("TP") else 0)
+        if skipped_timeout:
+            logger.debug(f"ML: {skipped_timeout} معامله بدون outcome قطعی/قدیمی یا TIMEOUT حذف شد")
+        return np.asarray(X, dtype=float), np.asarray(y, dtype=int)
 
     def should_retrain(self) -> bool:
         if not SKLEARN_AVAILABLE:
             return False
         n = len(self.memory.trades)
-        if n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 50):
+        if n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 60):
             return False
-        return (n - self.trained_on_n_trades) >= CONFIG.get("ML_RETRAIN_INTERVAL", 20)
+        valid_n = sum(1 for t in self.memory.trades if t.get("outcome_label") in ("TP1", "TP2", "TP3", "SL"))
+        if valid_n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 60):
+            return False
+        return (valid_n - self.trained_on_n_trades) >= CONFIG.get("ML_RETRAIN_INTERVAL", 50) or not self.is_trained
+
+    @staticmethod
+    def _make_models():
+        return {
+            "logistic": Pipeline([
+                ("scale", StandardScaler()),
+                ("model", LogisticRegression(C=0.5, max_iter=1000, class_weight="balanced", random_state=42)),
+            ]),
+            "gradient": HistGradientBoostingClassifier(
+                max_iter=80, max_leaf_nodes=7, learning_rate=0.04,
+                l2_regularization=1.0, random_state=42
+            ),
+        }
+
+    def _walk_forward(self, X, y):
+        min_train = CONFIG.get("ML_MIN_TRAIN_SAMPLES", 60)
+        block = CONFIG.get("ML_TEST_BLOCK", 25)
+        min_folds = CONFIG.get("ML_MIN_WF_FOLDS", 3)
+        results = {name: {"auc": [], "brier": [], "accuracy": []} for name in self._make_models()}
+        n = len(y)
+        if n < min_train + block * min_folds:
+            return results
+
+        # expanding-window WF؛ هیچ foldی آینده را به train نمی‌دهد.
+        fold_starts = list(range(min_train, n - block + 1, block))
+        for train_end in fold_starts:
+            test_end = min(train_end + block, n)
+            Xtr, ytr = X[:train_end], y[:train_end]
+            Xte, yte = X[train_end:test_end], y[train_end:test_end]
+            if len(set(ytr.tolist())) < 2 or len(set(yte.tolist())) < 2:
+                continue
+            for name, base in self._make_models().items():
+                try:
+                    # calibration فقط روی train همان fold و با تقسیم زمانی داخلی
+                    inner_splits = min(3, max(2, len(ytr) // 25))
+                    if len(ytr) >= 50 and inner_splits >= 2:
+                        calibrated = CalibratedClassifierCV(base, method="sigmoid", cv=TimeSeriesSplit(n_splits=inner_splits))
+                    else:
+                        calibrated = base
+                    calibrated.fit(Xtr, ytr)
+                    proba = calibrated.predict_proba(Xte)[:, 1]
+                    pred = (proba >= 0.5).astype(int)
+                    results[name]["auc"].append(float(roc_auc_score(yte, proba)))
+                    results[name]["brier"].append(float(brier_score_loss(yte, proba)))
+                    results[name]["accuracy"].append(float(accuracy_score(yte, pred)))
+                except Exception as e:
+                    logger.debug(f"ML WF {name} fold failed: {e}")
+        return results
 
     def train(self, force: bool = False) -> Optional[dict]:
-        """آموزش/بازآموزی مدل - با تقسیم train/test زمانی (نه تصادفی) سازگار با فلسفه‌ی
-        Walk-Forward که در بقیه‌ی سیستم استفاده شده، تا نتیجه‌ی تست واقعاً از آینده باشد نه گذشته."""
         if not SKLEARN_AVAILABLE:
             return None
         if not force and not self.should_retrain():
@@ -1387,54 +1492,74 @@ class MLConfidenceModel:
         try:
             X, y = self._build_dataset()
             n = len(y)
-            if n < CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 50):
+            min_n = CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 60)
+            if n < min_n or len(set(y.tolist())) < 2:
+                logger.info(f"🤖 ML: نمونه معتبر کافی نیست ({n}/{min_n})")
+                self.is_trained = False
                 return None
-            if len(set(y.tolist())) < 2:
-                logger.debug("مدل ML: هر دو کلاس (برد/باخت) لازم است، فعلاً موجود نیست")
+
+            wf = self._walk_forward(X, y)
+            candidates = []
+            for name, metrics in wf.items():
+                if len(metrics["auc"]) >= CONFIG.get("ML_MIN_WF_FOLDS", 3):
+                    candidates.append((
+                        name,
+                        float(np.mean(metrics["auc"])),
+                        float(np.std(metrics["auc"])),
+                        float(np.mean(metrics["brier"])),
+                        float(np.mean(metrics["accuracy"])),
+                        len(metrics["auc"]),
+                    ))
+            if not candidates:
+                logger.warning("🤖 ML: هنوز foldهای Walk-Forward معتبر کافی نیست")
+                self.is_trained = False
                 return None
-            
-            split_idx = int(n * CONFIG.get("WF_TRAIN_RATIO", 0.7))
-            split_idx = max(split_idx, n - max(10, int(n * 0.3)))
-            X_train, X_test = X[:split_idx], X[split_idx:]
-            y_train, y_test = y[:split_idx], y[split_idx:]
-            
-            if len(set(y_train.tolist())) < 2 or len(X_test) < 5:
-                logger.debug("مدل ML: داده کافی برای split معتبر نیست")
-                return None
-            
-            model = GradientBoostingClassifier(
-                n_estimators=80, max_depth=3, learning_rate=0.05,
-                subsample=0.8, random_state=42
+
+            # انتخاب بر اساس AUC، سپس پایداری، سپس Brier کمتر
+            candidates.sort(key=lambda z: (-z[1], z[2], z[3]))
+            best_name, wf_auc, wf_std, wf_brier, wf_acc, folds = candidates[0]
+
+            # آخرین fold برای گزارش تست نگه داشته می‌شود، ولی معیار activation میانگین WF است.
+            last_train_end = n - CONFIG.get("ML_TEST_BLOCK", 25)
+            last_train_end = max(CONFIG.get("ML_MIN_TRAIN_SAMPLES", 60), last_train_end)
+            base = self._make_models()[best_name]
+            inner_splits = min(3, max(2, last_train_end // 25))
+            final_model = CalibratedClassifierCV(base, method="sigmoid", cv=TimeSeriesSplit(n_splits=inner_splits))
+            final_model.fit(X[:last_train_end], y[:last_train_end])
+            X_test, y_test = X[last_train_end:], y[last_train_end:]
+            test_proba = final_model.predict_proba(X_test)[:, 1]
+            test_pred = (test_proba >= 0.5).astype(int)
+            last_auc = float(roc_auc_score(y_test, test_proba)) if len(set(y_test.tolist())) > 1 else None
+            last_acc = float(accuracy_score(y_test, test_pred))
+            last_brier = float(brier_score_loss(y_test, test_proba))
+
+            # مدل عملیاتی با تمام داده‌های موجود fit می‌شود؛ معیارها فقط از WF/آخرین تست می‌آیند.
+            operational_base = self._make_models()[best_name]
+            self.model = CalibratedClassifierCV(
+                operational_base, method="sigmoid", cv=TimeSeriesSplit(n_splits=min(3, max(2, n // 30)))
             )
-            model.fit(X_train, y_train)
-            
-            test_pred = model.predict(X_test)
-            test_acc = accuracy_score(y_test, test_pred)
-            try:
-                test_proba = model.predict_proba(X_test)[:, 1]
-                test_auc = roc_auc_score(y_test, test_proba) if len(set(y_test.tolist())) > 1 else None
-            except Exception:
-                test_auc = None
-            
-            # مدل نهایی روی کل داده (train+test) دوباره fit می‌شود تا از همه‌ی داده استفاده کند،
-            # ولی معیار کیفیت (AUC/accuracy) همان است که روی بخش test (که مدل ندیده بود) به‌دست آمد
-            final_model = GradientBoostingClassifier(
-                n_estimators=80, max_depth=3, learning_rate=0.05,
-                subsample=0.8, random_state=42
-            )
-            final_model.fit(X, y)
-            
-            self.model = final_model
+            self.model.fit(X, y)
             self.is_trained = True
             self.trained_on_n_trades = n
-            self.last_test_auc = round(float(test_auc), 3) if test_auc is not None else None
-            self.last_test_accuracy = round(float(test_acc), 3)
+            self.last_test_auc = round(last_auc, 3) if last_auc is not None else None
+            self.last_test_accuracy = round(last_acc, 3)
+            self.last_brier = round(last_brier, 4)
+            self.wf_auc_mean = round(wf_auc, 3)
+            self.wf_auc_std = round(wf_std, 3)
+            self.wf_folds = folds
+            self.selected_model_name = best_name
             self.last_train_time = time.time()
             self._save_model()
-            
-            logger.info(f"🤖 مدل ML آموزش دید: {n} معامله | دقت تست: {self.last_test_accuracy:.2f} | AUC تست: {self.last_test_auc}")
-            return {"n_trades": n, "test_accuracy": self.last_test_accuracy, "test_auc": self.last_test_auc}
-            
+            logger.info(
+                f"🤖 ML v2 آموزش دید: {n} نمونه معتبر | مدل={best_name} | "
+                f"WF AUC={wf_auc:.3f}±{wf_std:.3f} | folds={folds} | Brier={wf_brier:.4f}"
+            )
+            return {
+                "n_trades": n, "test_accuracy": self.last_test_accuracy,
+                "test_auc": self.last_test_auc, "wf_auc": self.wf_auc_mean,
+                "wf_auc_std": self.wf_auc_std, "wf_folds": folds,
+                "brier": self.last_brier, "model": best_name,
+            }
         except Exception as e:
             logger.error(f"خطا در آموزش مدل ML: {e}")
             return None
@@ -1443,41 +1568,34 @@ class MLConfidenceModel:
         if not self.is_trained or self.model is None:
             return None
         try:
-            row = [[float(features.get(name, 0.0)) if isinstance(features.get(name), (int, float)) else 0.0
-                    for name in self.FEATURE_NAMES]]
-            proba = self.model.predict_proba(row)[0][1]
-            return float(proba)
+            row = []
+            for name in self.FEATURE_NAMES:
+                v = features.get(name)
+                if v is None or not isinstance(v, (int, float)) or not np.isfinite(float(v)):
+                    return None
+                row.append(float(v))
+            return float(self.model.predict_proba([row])[0][1])
         except Exception as e:
             logger.debug(f"خطا در پیش‌بینی مدل ML: {e}")
             return None
 
     def get_influence_weight(self) -> float:
-        """سهم مدل ML از امتیاز نهایی - نه فقط بر اساس تعداد معاملات (بلوغ داده)، بلکه بر اساس
-        کیفیت واقعی مدل (AUC روی داده‌ی تست) هم گیت می‌شود. تجربه‌ی واقعی نشان داد بدون این گیت،
-        سهم مدل صرفاً با گذر زمان زیاد می‌شد حتی وقتی AUC از حدس تصادفی (0.5) هم بدتر بود -
-        یعنی داشتیم به یک مدل ضعیف‌تر از شانس، وزن بیشتری می‌دادیم. الان: اگر AUC به‌وضوح
-        بهتر از تصادفی نباشد، سهم صفر می‌ماند صرف‌نظر از تعداد معامله."""
         if not self.is_trained:
             return 0.0
-        
-        min_auc = CONFIG.get("ML_MIN_AUC_FOR_INFLUENCE", 0.55)
+        min_auc = CONFIG.get("ML_MIN_AUC_FOR_INFLUENCE", 0.56)
         full_auc = CONFIG.get("ML_FULL_AUC_FOR_INFLUENCE", 0.65)
-        if self.last_test_auc is None or self.last_test_auc < min_auc:
+        wf_auc = self.wf_auc_mean
+        if wf_auc is None or wf_auc < min_auc:
             return 0.0
-        auc_quality = min(1.0, (self.last_test_auc - min_auc) / max(0.01, (full_auc - min_auc)))
-        
+        if self.wf_folds < CONFIG.get("ML_MIN_WF_FOLDS", 3):
+            return 0.0
+        if self.wf_auc_std is not None and self.wf_auc_std > CONFIG.get("ML_MAX_WF_AUC_STD", 0.08):
+            return 0.0
+        quality = min(1.0, (wf_auc - min_auc) / max(0.01, full_auc - min_auc))
         n = self.trained_on_n_trades
-        min_t = CONFIG.get("ML_MIN_TRADES_TO_TRAIN", 50)
-        full_t = CONFIG.get("ML_FULL_MATURITY_TRADES", 250)
-        max_influence = CONFIG.get("ML_MAX_INFLUENCE", 0.35)
-        if n < min_t:
-            return 0.0
-        sample_maturity = 1.0 if n >= full_t else (n - min_t) / max(1, (full_t - min_t))
-        
-        # هر دو شرط باید برقرار باشند: هم داده کافی، هم کیفیت واقعی مدل - ضرب می‌شوند نه جمع،
-        # تا یک مدل تازه‌آموزش‌دیده با AUC عالی هم فوراً سهم کامل نگیرد و بالعکس
-        return sample_maturity * auc_quality * max_influence
-
+        full_t = CONFIG.get("ML_FULL_MATURITY_TRADES", 400)
+        maturity = min(1.0, n / max(1, full_t))
+        return maturity * quality * CONFIG.get("ML_MAX_INFLUENCE", 0.15)
 
 
 class PatternRecognizer:
@@ -1856,6 +1974,7 @@ class AutoLearningSystem:
                 "return_pct": return_pct,
                 "win": is_win,
                 "which_target": which_target,
+                "outcome_label": which_target if which_target in ("TP1", "TP2", "TP3", "SL") else "TIMEOUT",
                 "time_to_result_min": (candles_to_result * minutes_per_candle) if candles_to_result else None,
                 "mfe_pct": round(mfe_pct, 3),
                 "mae_pct": round(mae_pct, 3),
@@ -3047,12 +3166,12 @@ def calculate_signal_confidence_with_learning(signal_data: dict, current_feature
         min_t = CONFIG.get("WEIGHT_SHARPEN_MIN_TRADES", 100)
         full_t = CONFIG.get("WEIGHT_SHARPEN_FULL_TRADES", 300)
         if n_trades < min_t:
-            learned_share = 0.40
+            learned_share = 0.25
         elif n_trades >= full_t:
-            learned_share = 0.55
+            learned_share = 0.35
         else:
             progress = (n_trades - min_t) / max(1, (full_t - min_t))
-            learned_share = 0.40 + progress * (0.55 - 0.40)
+            learned_share = 0.25 + progress * (0.35 - 0.25)
         final_score = (score * (1 - learned_share)) + (weighted_score * learned_share)
         
         # اگر مدل ML واقعی آموزش دیده و بالغ کافی است، پیش‌بینی احتمال بردش هم وارد امتیاز نهایی می‌شود -
@@ -3498,8 +3617,12 @@ def build_learning_report(price_map: Dict[str, float]) -> str:
                 influence_pct = ml_model.get_influence_weight() * 100
                 lines.append(f"  • آموزش‌دیده روی {ml_model.trained_on_n_trades} معامله")
                 if ml_model.last_test_auc is not None:
-                    lines.append(f"  • AUC روی داده‌ی تست (ندیده): {ml_model.last_test_auc}")
-                lines.append(f"  • دقت روی داده‌ی تست: {ml_model.last_test_accuracy}")
+                    lines.append(f"  • AUC آخرین تست آینده‌ندیده: {ml_model.last_test_auc}")
+                if ml_model.wf_auc_mean is not None:
+                    lines.append(f"  • Walk-Forward AUC: {ml_model.wf_auc_mean} ± {ml_model.wf_auc_std} ({ml_model.wf_folds} fold)")
+                lines.append(f"  • مدل منتخب: {ml_model.selected_model_name or '-'}")
+                lines.append(f"  • Brier Score: {ml_model.last_brier}")
+                lines.append(f"  • دقت آخرین تست: {ml_model.last_test_accuracy}")
                 lines.append(f"  • سهم فعلی از امتیاز نهایی: {influence_pct:.0f}%")
                 min_auc = CONFIG.get("ML_MIN_AUC_FOR_INFLUENCE", 0.55)
                 if influence_pct == 0 and ml_model.last_test_auc is not None and ml_model.last_test_auc < min_auc:
