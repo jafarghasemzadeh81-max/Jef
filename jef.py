@@ -130,7 +130,7 @@ CONFIG = {
 
     # مدل یادگیری ماشین واقعی (فقط اگر scikit-learn نصب باشد فعال می‌شود)
     # ML محافظه‌کار: فقط معاملات دارای outcome قطعی TP/SL آموزش داده می‌شوند.
-    "ML_MIN_TRADES_TO_TRAIN": 60,       # حداقل نمونه‌های معتبر برای شروع
+    "ML_MIN_TRADES_TO_TRAIN": 30,       # حداقل نمونه‌های معتبر برای شروع
     "ML_RETRAIN_INTERVAL": 50,          # جلوگیری از بازآموزی بیش از حد و دنبال‌کردن نویز
     "ML_MAX_INFLUENCE": 0.15,            # ML فقط meta-filter است، نه تصمیم‌گیر اصلی
     "ML_FULL_MATURITY_TRADES": 400,      # بلوغ تدریجی
