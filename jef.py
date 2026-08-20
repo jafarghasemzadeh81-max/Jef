@@ -3,7 +3,7 @@
 
 """
 ═══════════════════════════════════════════════════════════════════════════
-         ADVANCED TRADING BOT v6.0 - COMPLETE FULL VERSION
+         ADVANCED TRADING BOT v6.1 - STABLE LEARNING VERSION
 ═══════════════════════════════════════════════════════════════════════════
 
 ✅ سیستم خطایابی کامل در هر بخش
@@ -106,6 +106,8 @@ PATHS = {
     "PATTERNS_FILE": os.path.join(DATA_DIR, "learned_patterns.json"),
     "AUTO_LEARN_QUEUE": os.path.join(DATA_DIR, "auto_learn_queue.json"),
     "PERFORMANCE_REPORT": os.path.join(DATA_DIR, "performance_report.json"),
+    "PERMANENT_TRADE_HISTORY": os.path.join(DATA_DIR, "all_trades_history.json"),
+    "PERMANENT_SIGNAL_HISTORY": os.path.join(DATA_DIR, "all_signals_history.json"),
     "ML_MODEL_FILE": os.path.join(DATA_DIR, "ml_model.joblib"),
     "DEBUG_LOG": os.path.join(DATA_DIR, "debug.log"),
 }
@@ -117,9 +119,11 @@ CONFIG = {
     "KLINE_INTERVAL": KLINE_INTERVAL,
     
     # آستانه‌های سیگنال
-    "PUMP_THRESHOLD": 2.2,   # کمی کاهش‌یافته نسبت به 2.8 برای افزایش تعداد سیگنال - نه به‌اندازه‌ی مقدار تستی قدیمی (1.6)
-    "DUMP_THRESHOLD": -2.2,
+    "PUMP_THRESHOLD": 2.8,   # کمی کاهش‌یافته نسبت به 2.8 برای افزایش تعداد سیگنال - نه به‌اندازه‌ی مقدار تستی قدیمی (1.6)
+    "DUMP_THRESHOLD": -2.8,
     "MIN_CONFIDENCE_SCORE": 6,  # به مقدار پایدار قبلی برگشت (5.5 با نمونه‌ی کم باعث افت واقعی کیفیت شد)
+    "REJECT_COUNTER_TREND_WARNINGS": True,  # سیگنال خلاف روند اصلی حذف شود؛ داده اخیر PF<1 است
+    "PERMANENT_HISTORY_ENABLED": True,
     "WEIGHT_SHARPEN_EXPONENT_MAX": 2.0,   # حداکثر شدت تشدید - فقط وقتی وزن‌ها با نمونه‌ی زیاد پخته شده باشند
     "WEIGHT_SHARPEN_MIN_TRADES": 100,     # زیر این تعداد معامله، اصلاً تشدید انجام نمی‌شود (خطر تشدید نویز)
     "WEIGHT_SHARPEN_FULL_TRADES": 300,    # از این تعداد به بعد، تشدید کامل (MAX) اعمال می‌شود
@@ -137,7 +141,7 @@ CONFIG = {
     "ML_MAX_WF_AUC_STD": 0.08,           # جلوگیری از مدل‌های ناپایدار
     "ML_MIN_TRAIN_SAMPLES": 60,          # حداقل train در هر fold
     "ML_TEST_BLOCK": 25,                 # اندازه هر بلوک تست Walk-Forward
-    "ML_MODEL_VERSION": 2,
+    "ML_MODEL_VERSION": 3,
     # آستانه‌ی اضافه بر اساس رژیم بازار - VOLATILE از قبل فیلتر سخت‌گیرانه دارد و جواب داده (وین‌ریت 55%).
     # حالا با نمونه‌ی بزرگ و پایدار (108 معامله)، TRENDING هم به‌طور پیوسته ضعیف عمل کرده (35%)
     # با اینکه 70% حجم سیگنال از همینجاست - آستانه‌ی متوسط (نه به‌شدت VOLATILE) تا حجم زیاد افت نکند
@@ -200,10 +204,10 @@ CONFIG = {
     
     # یادگیری
     "WF_TRAIN_RATIO": 0.7,
-    "LEARNING_WINDOW": 100,
+    "LEARNING_WINDOW": 200,
     "ADAPTIVE_UPDATE_INTERVAL": 24,
     "MIN_TRADES_FOR_LEARNING": 30,       # حداقل نمونه برای اینکه همبستگی آماری معنی‌دار باشد
-    "MIN_TRADES_FOR_CORRELATION": 15,    # حداقل نمونه برای محاسبه همبستگی هر فیچر
+    "MIN_TRADES_FOR_CORRELATION": 40,    # حداقل نمونه برای محاسبه همبستگی هر فیچر
     "LEARNING_RATE": 0.1,
     "MIN_WF_TEST_TRADES": 8,             # حداقل نمونه در بخش تست walk-forward
     "LEARNING_REPORT_INTERVAL_HOURS": 1, # هر چند ساعت گزارش یادگیری به تلگرام ارسال شود
@@ -237,8 +241,8 @@ CONFIG = {
     "ADX_TREND_MIN": 20,
     
     # تلگرام (اختیاری)
-    "TELEGRAM_BOT_TOKEN": "8044605578:AAEQEZcm8tNeZGD1FeYGw4bWe_n9Vb-pWFI",  # در صورت نیاز توکن خود را وارد کنید
-    "TELEGRAM_CHAT_ID": "-1002906437733",
+    "TELEGRAM_BOT_TOKEN": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+    "TELEGRAM_CHAT_ID": os.environ.get("TELEGRAM_CHAT_ID", ""),
 }
 
 BASE_CONFIG = CONFIG.copy()
@@ -501,21 +505,73 @@ class PerformanceMemory:
         self._load_history()
         logger.debug(f"PerformanceMemory راه‌اندازی شد - ظرفیت: {max_size}")
 
+    def _trade_key(self, trade: dict) -> str:
+        return f"{trade.get("timestamp", 0)}|{trade.get("symbol", "")}|{trade.get("direction", "")}|{trade.get("entry_price", 0)}"
+
     def _load_history(self):
+        """Load recent learning memory from permanent archive; migrate old report once."""
         try:
-            if os.path.exists(PATHS["PERFORMANCE_REPORT"]):
-                with open(PATHS["PERFORMANCE_REPORT"], "r") as f:
+            archive = []
+            archive_path = PATHS["PERMANENT_TRADE_HISTORY"]
+            if os.path.exists(archive_path):
+                with open(archive_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if "trades" in data:
-                        for trade in data["trades"][-200:]:
-                            self.trades.append(trade)
-                            self.short_term_trades.append(trade)
-                logger.info(f"{len(self.trades)} معامله از تاریخچه بارگذاری شد")
+                archive = data.get("trades", []) if isinstance(data, dict) else []
+            elif os.path.exists(PATHS["PERFORMANCE_REPORT"]):
+                with open(PATHS["PERFORMANCE_REPORT"], "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                archive = data.get("trades", []) if isinstance(data, dict) else []
+                _atomic_write_json(archive_path, {"trades": archive, "total_trades": len(archive), "migrated_at": time.time()})
+                logger.info(f"♻️ تاریخچه قدیمی به آرشیو دائمی منتقل شد: {len(archive)} معامله")
+
+            recent = archive[-self.trades.maxlen:]
+            short_recent = archive[-self.short_term_trades.maxlen:]
+            for trade in recent:
+                self.trades.append(trade)
+            for trade in short_recent:
+                self.short_term_trades.append(trade)
+            logger.info(f"🧠 {len(self.trades)} معامله اخیر بارگذاری شد | کل آرشیو: {len(archive)}")
         except Exception as e:
             logger.warning(f"خطا در بارگذاری تاریخچه: {e}")
 
     def _save_history(self):
-        _atomic_write_json(PATHS["PERFORMANCE_REPORT"], {"trades": list(self.trades), "timestamp": time.time()})
+        """Save capped learning memory plus uncapped permanent trade archive."""
+        try:
+            if not CONFIG.get("PERMANENT_HISTORY_ENABLED", True):
+                _atomic_write_json(PATHS["PERFORMANCE_REPORT"], {"trades": list(self.trades), "timestamp": time.time()})
+                return
+            archive_path = PATHS["PERMANENT_TRADE_HISTORY"]
+            archive = []
+            if os.path.exists(archive_path):
+                with open(archive_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                archive = data.get("trades", []) if isinstance(data, dict) else []
+            known = {self._trade_key(t) for t in archive}
+            for trade in self.trades:
+                key = self._trade_key(trade)
+                if key not in known:
+                    archive.append(trade)
+                    known.add(key)
+            _atomic_write_json(archive_path, {"trades": archive, "total_trades": len(archive), "updated_at": time.time()})
+            _atomic_write_json(PATHS["PERFORMANCE_REPORT"], {
+                "trades": list(self.trades),
+                "timestamp": time.time(),
+                "total_trades_all_time": len(archive),
+                "learning_memory_size": self.trades.maxlen,
+            })
+        except Exception as e:
+            logger.error(f"خطا در ذخیره تاریخچه: {e}")
+
+    def get_total_historical_trades(self) -> int:
+        try:
+            path = PATHS["PERMANENT_TRADE_HISTORY"]
+            if not os.path.exists(path):
+                return len(self.trades)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return len(data.get("trades", [])) if isinstance(data, dict) else len(self.trades)
+        except Exception:
+            return len(self.trades)
 
     def add_trade_result(self, trade_data: dict) -> None:
         """ذخیره نتیجه معامله با تمام جزئیات"""
@@ -775,22 +831,24 @@ class PerformanceMemory:
             return None
 
     def get_performance_trend(self, window: int = 20) -> str:
-        """تحلیل روند عملکرد (صعودی/نزولی/ثابت)"""
+        """روند عملکرد را از بلوک‌های واقعی معاملات محاسبه می‌کند."""
         try:
-            if len(self.performance_history) < window:
+            trades = list(self.trades)
+            if len(trades) < 60:
                 return "INSUFFICIENT_DATA"
-            recent = self.performance_history[-window:]
-            winrates = [p.get("winrate_short", 0) for p in recent]
+            block = max(10, int(window))
+            winrates = []
+            for end in range(block, len(trades) + 1, block):
+                chunk = trades[end-block:end]
+                winrates.append(sum(1 for t in chunk if t.get("win", False)) / len(chunk) * 100.0)
             if len(winrates) < 3:
-                return "STABLE"
-            x = list(range(len(winrates)))
-            slope = np.polyfit(x, winrates, 1)[0]
-            if slope > 0.5:
+                return "INSUFFICIENT_DATA"
+            slope = float(np.polyfit(range(len(winrates)), winrates, 1)[0])
+            if slope > 1.0:
                 return "IMPROVING"
-            elif slope < -0.5:
+            if slope < -1.0:
                 return "DECLINING"
-            else:
-                return "STABLE"
+            return "STABLE"
         except Exception as e:
             logger.error(f"خطا در تحلیل روند عملکرد: {e}")
             return "UNKNOWN"
@@ -820,6 +878,7 @@ class PerformanceMemory:
         """گزارش خلاصه از وضعیت"""
         return {
             "total_trades": len(self.trades),
+            "total_trades_all_time": self.get_total_historical_trades(),
             "short_term_trades": len(self.short_term_trades),
             "long_term_winrate": self.get_winrate(),
             "short_term_winrate": self.get_short_term_winrate(),
@@ -845,7 +904,17 @@ class PerformanceMemory:
             tp1_hits = [t for t in auto_trades if t.get("which_target") == "TP1"]
             sl_hits = [t for t in auto_trades if t.get("which_target") == "SL"]
             times_to_result = [t["time_to_result_min"] for t in auto_trades if t.get("time_to_result_min")]
-            mfe_on_losses = [t["mfe_pct"] for t in sl_hits if t.get("mfe_pct") is not None]
+            # MFE بازنده را به درصد مسیر TP1 نرمال می‌کنیم تا «نزدیکی به TP1» واقعاً قابل‌مقایسه باشد.
+            mfe_on_losses = []
+            for t in sl_hits:
+                if t.get("mfe_pct") is None:
+                    continue
+                feats = t.get("features", {})
+                tp1_distance = feats.get("tp1_distance_pct")
+                if isinstance(tp1_distance, (int, float)) and tp1_distance > 0:
+                    mfe_on_losses.append(min(1.0, max(0.0, float(t["mfe_pct"]) / tp1_distance)) * 100.0)
+                else:
+                    mfe_on_losses.append(float(t["mfe_pct"]))
             
             return {
                 "available": True,
@@ -1335,7 +1404,7 @@ class MLConfidenceModel:
         "volatility_regime", "adx_strength", "cci_signal", "williams_signal",
         "mfi_signal", "supertrend_alignment",
     ]
-    MODEL_VERSION = 2
+    MODEL_VERSION = 3
 
     def __init__(self, memory: "PerformanceMemory"):
         self.memory = memory
@@ -3391,6 +3460,11 @@ def analyze_symbol_full(symbol: str, direction_hint: Optional[str] = None, use_m
         }
         
         signal = enhance_signal_with_learning(signal, df)
+        if signal.get("tps") and signal.get("entry"):
+            try:
+                signal["learning_features"]["tp1_distance_pct"] = abs(float(signal["tps"][0]) - float(signal["entry"])) / float(signal["entry"]) * 100.0
+            except Exception:
+                pass
         return signal
         
     except Exception as e:
@@ -3427,6 +3501,9 @@ def enhanced_analysis(symbol: str, direction_hint: Optional[str] = None) -> Opti
             return None
         
         signal = analyze_symbol_full(symbol, direction_hint)
+        if signal and CONFIG.get("REJECT_COUNTER_TREND_WARNINGS", True) and "⚠️" in str(signal.get("direction", "")):
+            logger.debug(f"{symbol}: رد شد (سیگنال خلاف روند اصلی)")
+            return None
         
         # آستانه‌ی اطمینان بر اساس رژیم بازار تنظیم می‌شود - داده‌ی واقعی نشان داد رژیم VOLATILE
         # با اختلاف زیاد ضعیف‌ترین وین‌ریت را دارد ولی بیشترین سهم معاملات را هم به خودش اختصاص می‌دهد،
@@ -3522,6 +3599,24 @@ def create_ml_features(df: pd.DataFrame) -> pd.DataFrame:
 def save_signal_json_overwrite(signals: List[dict]) -> None:
     save_json_file(PATHS["FINAL_SIGNAL_FILE"], signals)
 
+def save_permanent_signal_history(signal: Dict[str, Any]) -> None:
+    """ذخیره دائمی همه سیگنال‌ها برای شمارش و تحلیل بلندمدت."""
+    try:
+        path = PATHS["PERMANENT_SIGNAL_HISTORY"]
+        data = load_json_file(path) or {"signals": []}
+        if not isinstance(data, dict):
+            data = {"signals": []}
+        signals = data.get("signals", [])
+        record = dict(signal)
+        record.setdefault("ts", int(time.time()))
+        key = f"{record.get('ts',0)}|{record.get('symbol','')}|{record.get('direction','')}|{record.get('entry',0)}"
+        known = {f"{x.get('ts',0)}|{x.get('symbol','')}|{x.get('direction','')}|{x.get('entry',0)}" for x in signals[-10000:]}
+        if key not in known:
+            signals.append(record)
+        _atomic_write_json(path, {"signals": signals, "total_signals": len(signals), "updated_at": time.time()})
+    except Exception as e:
+        logger.error(f"خطا در ذخیره آرشیو دائمی سیگنال: {e}")
+
 def save_signal_history(signal: Dict[str, Any]) -> None:
     try:
         history = load_json_file(PATHS["SIGNAL_HISTORY_FILE"]) or []
@@ -3546,7 +3641,7 @@ def update_learning_system() -> None:
     param_optimizer.apply_optimized_params()
     weight_learner.update_weights()
     pattern_recognizer.learn_patterns()
-    ml_model.train(force=True)  # بازآموزی کامل مدل ML هر 24 ساعت، صرف‌نظر از فاصله‌ی معمول
+    ml_model.train(force=False)  # فقط وقتی داده‌ی معتبر جدید به حد بازآموزی رسیده باشد
     param_optimizer.optimize_regime_thresholds()
     
     summary = performance_memory.get_summary()
@@ -3579,7 +3674,8 @@ def build_learning_report(price_map: Dict[str, float]) -> str:
         
         lines.append("")
         lines.append("📊 عملکرد کلی:")
-        lines.append(f"  • تعداد معاملات ثبت‌شده: {summary['total_trades']}")
+        lines.append(f"  • تعداد معاملات ثبت‌شده (حافظه یادگیری): {summary['total_trades']}")
+        lines.append(f"  • کل معاملات ثبت‌شده در آرشیو: {summary.get('total_trades_all_time', summary['total_trades'])}")
         lines.append(f"  • وین‌ریت کل: {summary['long_term_winrate']:.1f}%")
         lines.append(f"  • وین‌ریت اخیر (کوتاه‌مدت): {summary['short_term_winrate']:.1f}%")
         lines.append(f"  • فاکتور سود: {summary.get('profit_factor', 0):.2f}")
@@ -3759,6 +3855,7 @@ def main_loop():
                     summary["pre_signal_change_15m"] = change_15m
                     signals.append(summary)
                     save_signal_history(summary)
+                    save_permanent_signal_history(summary)
                     auto_learning.add_signal_for_learning(summary)
                     signal_count += 1
                     
