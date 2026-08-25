@@ -1,13 +1,3 @@
-# === TELEGRAM CONFIGURATION (20 PRO) ===
-TELEGRAM_BOT_TOKEN = "8044605578:AAEQEZcm8tNeZGD1FeYGW4bWe_n9Vb-pWFI",
-TELEGRAM_CHAT_ID = "-1002906437733"
-# =========================================
-
-# === TELEGRAM CONFIG ===
-TELEGRAM_BOT_TOKEN = "8044605578:AAEQEZcm8tNeZGD1FeYGW4bWe_n9Vb-pWFI",
-TELEGRAM_CHAT_ID = "-1002906437733"
-# =========================
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
