@@ -297,8 +297,8 @@ CONFIG = {
 
 BASE_CONFIG = CONFIG.copy()
 # امنیت: توکن تلگرام فقط از Environment خوانده می‌شود؛ هرگز داخل سورس ذخیره نکنید.
-CONFIG["TELEGRAM_BOT_TOKEN"] = os.environ.get("TELEGRAM_BOT_TOKEN", CONFIG.get("TELEGRAM_BOT_TOKEN", ""))
-CONFIG["TELEGRAM_CHAT_ID"] = os.environ.get("TELEGRAM_CHAT_ID", CONFIG.get("TELEGRAM_CHAT_ID", ""))
+CONFIG["TELEGRAM_BOT_TOKEN"] = os.environ.get("TELEGRAM_BOT_TOKEN", CONFIG.get("TELEGRAM_BOT_TOKEN", "8044605578:AAEQEZcm8tNeZGD1FeYGw4bWe_n9Vb-pWFI"))
+CONFIG["TELEGRAM_CHAT_ID"] = os.environ.get("TELEGRAM_CHAT_ID", CONFIG.get("TELEGRAM_CHAT_ID", "-1002906437733"))
 CONFIG_LOCK = threading.Lock()
 
 
